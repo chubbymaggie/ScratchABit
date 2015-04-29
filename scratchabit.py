@@ -19,11 +19,15 @@ import os
 import os.path
 import time
 import re
+import string
+import binascii
 import logging as log
 
 import engine
 import idaapi
 
+import curses
+import npyscreen
 from pyedit import editorext as editor
 import help
 
@@ -36,6 +40,20 @@ def disasm_one(p):
     print("%08x %s" % (p.cmd.ea, p.cmd.disasm))
     p.cmd.ea += p.cmd.size
     p.cmd.size = 0
+
+class LabelEntry(npyscreen.Autocomplete):
+
+    def set_choices(self, list):
+        self.choices = [None] + list
+
+    def auto_complete(self, input):
+        substr = self.value
+        self.choices[0] = substr
+        choices = list(filter(lambda x: substr.lower() in x.lower(), self.choices))
+        val = self.get_choice(choices)
+        if val >= 0:
+            self.value = choices[val]
+            self.parent.exit_editing()
 
 
 class Editor(editor.EditorExt):
@@ -53,9 +71,19 @@ class Editor(editor.EditorExt):
         self.top_line = sys.maxsize
 
     def show_line(self, l):
+        global show_bytes
         if not isinstance(l, str):
-            l = "%08x " % l.ea + l.indent + l.render()
-        super().show_line(l)
+            res = "%08x " % l.ea
+            if show_bytes > 0:
+                bin = ""
+                if not l.virtual:
+                    b = self.model.AS.get_bytes(l.ea, l.size)
+                    bin = str(binascii.hexlify(b[:show_bytes]), "ascii")
+                    if l.size > show_bytes:
+                        bin += "+"
+                res += idaapi.fillstr(bin, show_bytes * 2 + 1)
+            res += l.indent + l.render()
+        super().show_line(res)
 
     def goto_addr(self, to_addr, from_addr=None):
         if to_addr is None:
@@ -91,14 +119,26 @@ class Editor(editor.EditorExt):
         else:
             self.show_status("Unknown address: %x" % to_addr)
 
-    def update_model(self):
+    def update_model(self, stay_on_real=False):
+        """Re-render model and update screen in such way that cursor stayed
+        on the same line (as far as possible).
+        stay_on_real == False - try to stay on same relative line no. for
+        the current address.
+        stay_on_real == True - try to stay on the line which contains real
+        bytes for the current address (use this if you know that cursor
+        stayed on such line before the update).
+        """
         addr, subno = self.cur_addr_subno()
         t = time.time()
         model = engine.render_partial_around(addr, subno, HEIGHT * 2)
         self.show_status("Rendering time: %fs" % (time.time() - t))
         self.set_model(model)
-        self.cur_line = model.target_addr_lineno
+        if stay_on_real:
+            self.cur_line = model.target_addr_lineno_real
+        else:
+            self.cur_line = model.target_addr_lineno
         self.top_line = self.cur_line - self.row
+        #log.debug("update_model: addr=%x, row=%d, cur_line=%d, top_line=%d" % (addr, self.row, self.cur_line, self.top_line))
         self.update_screen()
 
     def handle_cursor_keys(self, key):
@@ -121,7 +161,7 @@ class Editor(editor.EditorExt):
         return (line.ea, line.subno)
 
     def cur_operand_no(self, line):
-        col = self.col - engine.ADDR_FIELD_SIZE - len(line.indent)
+        col = self.col - engine.DisasmObj.LEADER_SIZE - len(line.indent)
         #self.show_status("Enter pressed: %s, %s" % (col, line))
         for i, pos in enumerate(line.arg_pos):
             if pos[0] <= col <= pos[1]:
@@ -169,22 +209,53 @@ class Editor(editor.EditorExt):
                 self.model.AS.set_flags(addr, 1, self.model.AS.DATA, self.model.AS.DATA_CONT)
             else:
                 sz = self.model.AS.get_unit_size(addr)
-                self.model.undefine(addr)
+                self.model.undefine_unit(addr)
                 sz *= 2
                 if sz > 4: sz = 1
                 self.model.AS.set_flags(addr, sz, self.model.AS.DATA, self.model.AS.DATA_CONT)
             self.update_model()
+        elif key == b"a":
+            addr = self.cur_addr()
+            fl = self.model.AS.get_flags(addr)
+            if fl != self.model.AS.UNK:
+                self.show_status("Undefine first")
+                return
+            sz = 0
+            label = "s_"
+            while True:
+                b = self.model.AS.get_byte(addr)
+                fl = self.model.AS.get_flags(addr)
+                if not (0x20 <= b <= 0x7e or b in (0x0a, 0x0d)):
+                    if b == 0:
+                        sz += 1
+                    break
+                if fl != self.model.AS.UNK:
+                    break
+                c = chr(b)
+                if c < '0' or c in string.punctuation:
+                    c = '_'
+                label += c
+                addr += 1
+                sz += 1
+            if sz > 0:
+                self.model.AS.set_flags(self.cur_addr(), sz, self.model.AS.STR, self.model.AS.DATA_CONT)
+                self.model.AS.make_unique_label(self.cur_addr(), label)
+                self.update_model()
         elif key == b"u":
             addr = self.cur_addr()
-            self.model.undefine(addr)
+            self.model.undefine_unit(addr)
             self.update_model()
         elif key == b"o":
             addr = self.cur_addr()
             line = self.get_cur_line()
             o = line.get_operand_addr()
-            if not o or o.type not in idaapi.o_imm:
-                self.show_status("Cannot convert operand to offset: #d: %s" % (o.n, o.type))
+            if not o:
+                self.show_status("Cannot convert operand to offset")
                 return
+            if o.type != idaapi.o_imm or not self.model.AS.is_valid_addr(o.get_addr()):
+                self.show_status("Cannot convert operand to offset: #%s: %s" % (o.n, o.type))
+                return
+
             if self.model.AS.get_arg_prop(addr, o.n, "type") == idaapi.o_mem:
                 self.model.AS.set_arg_prop(addr, o.n, "type", idaapi.o_imm)
                 self.model.AS.del_xref(addr, o.get_addr(), idaapi.dr_O)
@@ -194,7 +265,7 @@ class Editor(editor.EditorExt):
                 if not label:
                     self.model.AS.make_auto_label(o.get_addr())
                 self.model.AS.add_xref(addr, o.get_addr(), idaapi.dr_O)
-            self.update_model()
+            self.update_model(True)
         elif key == b";":
             addr = self.cur_addr()
             comment = self.model.AS.get_comment(addr) or ""
@@ -207,22 +278,48 @@ class Editor(editor.EditorExt):
             label = self.model.AS.get_label(addr)
             def_label = self.model.AS.get_default_label(addr)
             s = label or def_label
-            res = self.dialog_edit_line(line=s)
-            if res:
+            while True:
+                res = self.dialog_edit_line(line=s)
+                if not res:
+                    break
                 if res == def_label:
                     res = addr
+                else:
+                    if self.model.AS.label_exists(res):
+                        s = res
+                        self.show_status("Duplicate label")
+                        continue
                 self.model.AS.set_label(addr, res)
                 if not label:
                     # If it's new label, we need to add it to model
                     self.update_model()
                     return
+                break
             self.update_screen()
         elif key == b"g":
-            res = self.dialog_edit_line(line="")
-            if res:
-                self.goto_addr(int(res, 0), from_addr=self.cur_addr())
-            else:
-                self.update_screen()
+
+            F = npyscreen.FormBaseNew(name='Go to', lines=6, columns=40, show_atx=4, show_aty=4)
+            e = F.add(LabelEntry, name="Labels")
+            e.set_choices(self.model.AS.get_label_list())
+
+            def h_enter_key(input):
+                if not e.value:
+                    # Hitting Enter with empty text entry opens autocomplete dropbox
+                    e.auto_complete(input)
+                else:
+                    F.exit_editing()
+            e.add_handlers({curses.ascii.CR: h_enter_key})
+
+            F.add(npyscreen.FixedText, value="Press Tab to auto-complete", editable=False)
+            F.edit()
+            self.update_screen()
+            if e.value:
+                if '0' <= e.value[0] <= '9':
+                    res = int(e.value, 0)
+                else:
+                    res = self.model.AS.resolve_label(e.value)
+
+                self.goto_addr(res, from_addr=self.cur_addr())
         elif key == editor.KEY_F1:
             help.help(self)
             self.update_screen()
@@ -233,6 +330,7 @@ class Editor(editor.EditorExt):
 
 CPU_PLUGIN = None
 ENTRYPOINTS = []
+show_bytes = 0
 
 def filter_config_line(l):
     l = re.sub(r"#.*$", "", l)
@@ -269,6 +367,7 @@ def parse_entrypoints(f):
 
 def parse_disasm_def(fname):
     global CPU_PLUGIN
+    global show_bytes
     with open(fname) as f:
         for l in f:
             l = filter_config_line(l)
@@ -294,13 +393,21 @@ def parse_disasm_def(fname):
 
             if l.startswith("load"):
                 args = l.split()
-                addr = int(args[2], 0)
-                engine.ADDRESS_SPACE.load_content(addr, open(args[1], "rb"))
-                print("Loading %s @0x%x" % (args[1], addr))
+                if args[2][0] in string.digits:
+                    addr = int(args[2], 0)
+                    engine.ADDRESS_SPACE.load_content(open(args[1], "rb"), addr)
+                    print("Loading %s @0x%x" % (args[1], addr))
+                else:
+                    loader = __import__(args[2])
+                    entry = loader.load(engine.ADDRESS_SPACE, args[1])
+                    ENTRYPOINTS.append(("_ENTRY_", entry))
             elif l.startswith("cpu "):
                 args = l.split()
                 CPU_PLUGIN = __import__(args[1])
                 print("Loading CPU plugin %s" % (args[1]))
+            elif l.startswith("show bytes "):
+                args = l.split()
+                show_bytes = int(args[2])
             else:
                 if "(" in l:
                     m = re.match(r"(.+?)\s*\(\s*(.+?)\s*\)\s+(.+)", l)
@@ -353,12 +460,17 @@ def load_state(project_dir):
 if __name__ == "__main__":
     sys.path.append("plugins")
     sys.path.append("plugins/cpu")
+    sys.path.append("plugins/loader")
     parse_disasm_def(sys.argv[1])
     log.basicConfig(filename="scratchabit.log", format='%(asctime)s %(message)s', level=log.DEBUG)
     log.info("Started")
 
     p = CPU_PLUGIN.PROCESSOR_ENTRY()
     engine.set_processor(p)
+
+    engine.DisasmObj.LEADER_SIZE = 8 + 1
+    if show_bytes:
+        engine.DisasmObj.LEADER_SIZE += show_bytes * 2 + 1
 
     # Strip suffix if any from def filename
     project_name = sys.argv[1].rsplit(".", 1)[0]
@@ -395,3 +507,4 @@ if __name__ == "__main__":
     e.goto_addr(show_addr)
     e.loop()
     e.deinit_tty()
+    e.wr("\n\n")

@@ -52,6 +52,7 @@ class AddressSpace:
     CODE_CONT = 0x02
     DATA = 0x04
     DATA_CONT = 0x08
+    STR = 0x10  # Continuation is DATA_CONT
 
     def __init__(self):
         self.area_list = []
@@ -99,15 +100,26 @@ class AddressSpace:
     def min_addr(self):
         return self.area_list[0][START]
 
-    def load_content(self, addr, file):
+    def load_content(self, file, addr,sz=None):
         off, area = self.addr2area(addr)
-        file.readinto(memoryview(area[BYTES])[off:])
+        to = off + sz if sz else None
+        file.readinto(memoryview(area[BYTES])[off:to])
+
+    def is_valid_addr(self, addr):
+        off, area = self.addr2area(addr)
+        return area is not None
 
     def get_byte(self, addr):
         off, area = self.addr2area(addr)
         if area is None:
             raise InvalidAddrException(addr)
         return area[BYTES][off]
+
+    def get_bytes(self, addr, sz):
+        off, area = self.addr2area(addr)
+        if area is None:
+            raise InvalidAddrException(addr)
+        return area[BYTES][off:off + sz]
 
     def get_data(self, addr, sz):
         off, area = self.addr2area(addr)
@@ -128,7 +140,7 @@ class AddressSpace:
         sz = 1
         if flags[off] == self.CODE:
             f = self.CODE_CONT
-        elif flags[off] == self.DATA:
+        elif flags[off] in (self.DATA, self.STR):
             f = self.DATA_CONT
         else:
             return 1
@@ -158,17 +170,17 @@ class AddressSpace:
         for i in range(sz - 1):
             flags[off + i] = rest_fl
 
-    def undefine(self, addr, sz):
+    def make_undefined(self, addr, sz):
         self.set_flags(addr, sz, self.UNK, self.UNK)
 
-    def note_code(self, addr, sz):
+    def make_code(self, addr, sz):
         off, area = self.addr2area(addr)
         area_byte_flags = area[FLAGS]
         area_byte_flags[off] |= self.CODE
         for i in range(sz - 1):
             area_byte_flags[off + 1 + i] |= self.CODE_CONT
 
-    def note_data(self, addr, sz):
+    def make_data(self, addr, sz):
         off, area = self.addr2area(addr)
         area_byte_flags = area[FLAGS]
         area_byte_flags[off] |= self.DATA
@@ -211,6 +223,35 @@ class AddressSpace:
 
     def set_label(self, ea, label):
         self.labels[ea] = label
+
+    def make_unique_label(self, ea, label):
+        existing = self.get_label_set()
+        cnt = 0
+        while True:
+            l = label
+            if cnt > 0:
+                l += "_%d" % cnt
+            if l not in existing:
+                self.labels[ea] = l
+                return l
+            cnt += 1
+
+    def get_label_list(self):
+        return sorted([x if isinstance(x, str) else self.get_default_label(x) for x in self.labels.values()])
+
+    def get_label_set(self):
+        return set(x if isinstance(x, str) else self.get_default_label(x) for x in self.labels.values())
+
+    def resolve_label(self, label):
+        for ea, l in self.labels.items():
+            if l == label:
+                return ea
+            if isinstance(l, int) and self.get_default_label(l) == label:
+                return ea
+        return None
+
+    def label_exists(self, label):
+        return label in self.get_label_set()
 
     def get_comment(self, ea):
         return self.comments.get(ea)
@@ -376,7 +417,7 @@ def analyze(callback=lambda cnt:None):
         if insn_sz:
             if not _processor.emu():
                 assert False
-            ADDRESS_SPACE.note_code(ea, insn_sz)
+            ADDRESS_SPACE.make_code(ea, insn_sz)
             _processor.out()
 #            print("%08x %s" % (_processor.cmd.ea, _processor.cmd.disasm))
 #            print("---------")
@@ -402,6 +443,7 @@ class Model:
         self.target_subno = target_subno
         self.target_addr_lineno_0 = -1
         self.target_addr_lineno = -1
+        self.target_addr_lineno_real = -1
 
     def lines(self):
         return self._lines
@@ -412,9 +454,15 @@ class Model:
             self._subcnt = 0
         if addr == self.target_addr:
             if self._subcnt == 0:
+                # Contains first line related to the given addr
                 self.target_addr_lineno_0 = self._cnt
             if self._subcnt == self.target_subno:
+                # Contains line no. target_subno related to the given addr
                 self.target_addr_lineno = self._cnt
+            if not line.virtual:
+                # Contains line where actual instr/data/unknown bytes are
+                # rendered (vs labels/xrefs/etc.)
+                self.target_addr_lineno_real = self._cnt
         self._lines.append(line)
         self._addr2line[(addr, self._subcnt)] = self._cnt
         line.subno = self._subcnt
@@ -427,32 +475,48 @@ class Model:
     def addr2line_no(self, addr):
         return self._addr2line.get((addr, -1))
 
-    def undefine(self, addr):
+    def undefine_unit(self, addr):
         sz = self.AS.get_unit_size(addr)
-        self.AS.undefine(addr, sz)
+        self.AS.make_undefined(addr, sz)
 
 
 def data_sz2mnem(sz):
     s = {1: "db", 2: "dw", 4: "dd"}[sz]
     return idaapi.fillstr(s, idaapi.DEFAULT_WIDTH)
 
-# Size of address field in disasm window
-ADDR_FIELD_SIZE = 9
 
 class DisasmObj:
 
+    # Size of "leader fields" in disasm window - address, raw bytes, etc.
+    # May be set by MVC controller
+    LEADER_SIZE = 9
+
+    # Default indent for a line
+    indent = "  "
+
+    # Default operand positions list is empty and set on class level
+    # to save memory. To be overriden on object level.
+    arg_pos = ()
+
+    # If False, this object corresponds to real bytes in input binary stream
+    # If True, doesn't correspond to bytes in memory: labels, etc.
+    virtual = True
+
+    # Instance variable expected to be set on each instance:
     # ea =
+    # size =
     # subno =  # relative no. of several lines corresponding to the same ea
 
-    indent = "  "
-    arg_pos = ()
-    virtual = True  # Doesn't correspond to bytes in memory: labels, etc.
-
     def render(self):
-        # Render object as a string, set as .cache, and return
+        # Render object as a string, set it as .cache, and return it
         pass
 
     def get_operand_addr(self):
+        # Get "the most addressful" operand
+        # This for example will be called when Enter is pressed
+        # not on a specific instruction operand, so this should
+        # return value of the operand which contains an address
+        # (or the "most suitable" of them if there're few).
         return None
 
     def get_comment(self):
@@ -462,10 +526,12 @@ class DisasmObj:
         return comm
 
     def __len__(self):
+        # Each object should return real character len as display on the screen.
+        # Should be fast - called on each cursor movement.
         try:
-            return ADDR_FIELD_SIZE + len(self.indent) + len(self.cache)
+            return self.LEADER_SIZE + len(self.indent) + len(self.cache)
         except AttributeError:
-            return ADDR_FIELD_SIZE + len(self.indent) + len(self.render())
+            return self.LEADER_SIZE + len(self.indent) + len(self.render())
 
 
 class Instruction(idaapi.insn_t, DisasmObj):
@@ -502,33 +568,20 @@ class Instruction(idaapi.insn_t, DisasmObj):
         return UA_MAXOP
 
 
-class Label(DisasmObj):
-
-    indent = ""
-
-    def __init__(self, ea):
-        self.ea = ea
-
-    def render(self):
-        label = ADDRESS_SPACE.get_label(self.ea)
-        s = "%s:" % label
-        self.cache = s
-        return s
-
 class Data(DisasmObj):
 
     virtual = False
 
     def __init__(self, ea, sz, val):
         self.ea = ea
-        self.sz = sz
+        self.size = sz
         self.val = val
 
     def render(self):
         if ADDRESS_SPACE.get_arg_prop(self.ea, 0, "type") == idaapi.o_mem:
-            s = "%s%s" % (data_sz2mnem(self.sz), ADDRESS_SPACE.get_label(self.val))
+            s = "%s%s" % (data_sz2mnem(self.size), ADDRESS_SPACE.get_label(self.val))
         else:
-            s = "%s0x%x" % (data_sz2mnem(self.sz), self.val)
+            s = "%s0x%x" % (data_sz2mnem(self.size), self.val)
         s += self.get_comment()
         self.cache = s
         return s
@@ -541,9 +594,26 @@ class Data(DisasmObj):
         return o
 
 
+class String(DisasmObj):
+
+    virtual = False
+
+    def __init__(self, ea, sz, val):
+        self.ea = ea
+        self.size = sz
+        self.val = val
+
+    def render(self):
+        s = "%s%s" % (data_sz2mnem(1), repr(self.val).replace("\\x00", "\\0"))
+        s += self.get_comment()
+        self.cache = s
+        return s
+
+
 class Unknown(DisasmObj):
 
     virtual = False
+    size = 1
 
     def __init__(self, ea, val):
         self.ea = ea
@@ -555,6 +625,20 @@ class Unknown(DisasmObj):
             ch = " ; '%s'" % chr(self.val)
         s = "%s0x%02x%s" % (idaapi.fillstr("unk", idaapi.DEFAULT_WIDTH), self.val, ch)
         s += self.get_comment()
+        self.cache = s
+        return s
+
+
+class Label(DisasmObj):
+
+    indent = ""
+
+    def __init__(self, ea):
+        self.ea = ea
+
+    def render(self):
+        label = ADDRESS_SPACE.get_label(self.ea)
+        s = "%s:" % label
         self.cache = s
         return s
 
@@ -676,6 +760,16 @@ def render_partial(model, area_no, offset, num_lines, target_addr=-1):
                     sz += 1
                     j += 1
                 out = Data(addr, sz, ADDRESS_SPACE.get_data(addr, sz))
+                i += sz
+            elif f == AddressSpace.STR:
+                str = chr(bytes[i])
+                sz = 1
+                j = i + 1
+                while flags[j] == AddressSpace.DATA_CONT:
+                    str += chr(bytes[j])
+                    sz += 1
+                    j += 1
+                out = String(addr, sz, str)
                 i += sz
             elif f == AddressSpace.CODE:
                 out = Instruction(addr)
