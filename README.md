@@ -41,52 +41,83 @@ systems.
 Quick start
 -----------
 
-Clone the code using "git clone --recursive". If you cloned code without
-"--recursive", run "git submodule update --init".
+To use ScratchABit, you need Python3 installed and VT100 (minimum) or
+XTerm (recommended) terminal or terminal emulator (any Unix system
+should be compliant, like Linux/BSD/etc, see also FAQ).
 
-The repository includes a simple x86_64 binary code, and corresponding
-disassembly definition file. Start ScratchABit, giving the latter as
-a parameter:
+Clone the code using:
+
+    git clone --recursive https://github.com/pfalcon/ScratchABit
+
+If you cloned code without `--recursive`, run `git submodule update --init`.
+
+If you want to disassemble a file in self-describing executable format
+(like ELF), just pass it as an argument to scratchabit.py. The repository
+includes `example-elf` (x86 32bit) for quick start:
+
+    python3 scratchabit.py example-elf
+
+Alternatively, if you want to disassemble a raw binary file, you need
+to creat a .def (definition) file, to specify what memory areas are
+defined for the code, where to load binary file, etc. The repository
+includes a simple x86_64 raw binary code, and corresponding .def file:
 
     python3 scratchabit.py example.def
 
 Press F1 if in doubt what to do next.
 
-The above will work as expected if you're running on the terminal
-supporting VT100 emulation, which is the case on Linux and should
-be the case on any other modern Unix/POSIX system. If you are not
-on such system, see the FAQ.
+Using Plugins
+-------------
 
+IDAPython processor plugins can be loaded from anywhere on the Python
+module path. Alternatively, you can symlink the plugin .py file into
+the plugins/cpu subdirectory.
+
+After the plugin is made available, create a new definition file based
+on example.def that sets the plugin module name in the 'cpu xxx' line.
+
+For a very simple example that uses an external plugin, see this
+[esp8266.def file](https://gist.github.com/projectgus/f898d5798e3e44240796)
+that works with the xtensa.py file from the
+[ida-xtensa repository](https://github.com/pfalcon/ida-xtensa).
 
 TODO/Things to decide
 ---------------------
 
-* Currently works with flat binary files, add ELF support.
-* Currently uses multiple files for "database", each storing particular
-  type of information. Switch to a single YAML file instead?
+* ~~Currently uses multiple files for "database", each storing particular
+  type of information. Switch to a single YAML file instead?~~
 * Add color (low priority, (unbloated!) patches welcome).
-* Few important UI commands to implement yet for comfortable work (e.g.
-  list/search a label).
+* Few important UI commands to implement yet for comfortable work.
 * Offer to save DB on quit if modified.
 * Git integration for DB saving.
-* Improve robustness (add exception handler at the main loop level, don't
-  abort the application, show to user/log and continue).
+* ~~Improve robustness (add exception handler at the main loop level, don't
+  abort the application, show to user/log and continue).~~
 * Try to deal with code flow inconsistencies (e.g. within an instruction
   - low priority for intended usage) and data access inconsistencies (e.g.
   accessing individual bytes of previosly detected word - higher priority).
 * See how to support other types of IDAPython plugins besides just processor
   modules.
+* Parse and use debugging information (e.g. DWARF) present in ELF (etc.)
+  files.
 
 
 FAQ
 ---
 
-Q: What processors/architectures are supported?
+> Q: What processors/architectures are supported?
+
 A: ScratchABit doesn't support any processor architectures on its own,
 it is fully retargettable using IDAPython API plugins. Many plugins are
 available, writing a new plugin is easy. To let users test-drive
 ScratchABit, a very simple (!) X86 processor plugin is included in the
 distribution, using Pymsasid disassembler under the hood.
 
-Q: I'm not on Linux, how can I run ScratchABit?
-A: Install Linux in an emulator on your system and rejoice.
+> Q: I'm not on Linux, how can I run ScratchABit?
+
+A: Install Linux in an emulator/VM on your system and rejoice.
+
+> Q: Mandatory screenshot?
+
+A: Sure:
+
+![screenshot](https://raw.githubusercontent.com/pfalcon/ScratchABit/master/docs/scratchabit.png)

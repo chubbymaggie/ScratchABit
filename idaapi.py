@@ -32,8 +32,13 @@ UA_MAXOP = 6
 
 # Operand types
 o_void = "-"
+# Immediate value, can be either numeric value, or address of memory
+# ("offset"), further differentiated by value subtype (offset, hex, dec, etc.)
 o_imm = "o_imm"
 o_reg = "o_reg"
+# Location in memory. Should be used only if instruction guaranteedly
+# access memory at the given address of the given size (direct addressing
+# mode). Should not be mixed up with o_imm of offset subtype.
 o_mem = "o_mem"
 o_near = "o_near"
 o_phrase = "o_phrase"
@@ -146,6 +151,13 @@ class processor_t:
 #
 
 COLOR_ERROR = "*"
+# Non-IDAPython symbols
+# Default instruction field width, 8 is IDA standard
+DEFAULT_WIDTH = 8
+# Default indentation of instructions
+DEFAULT_INDENT = 4
+# Default indentation of xref comments
+DEFAULT_XREF_INDENT = 13
 
 u_line = None
 
@@ -162,9 +174,7 @@ def fillstr(s, width):
         s += " " * (width - len(s))
     return s
 
-DEFAULT_WIDTH = 16
-
-def OutMnem(width):
+def OutMnem(width=DEFAULT_WIDTH):
     global _processor, u_line
 #    print(_processor.instruc[cmd.itype])
     s = _processor.instruc[_processor.cmd.itype]["name"]
@@ -189,30 +199,53 @@ def out_one_operand(op_no):
     global _processor, u_line
     cmd = _processor.cmd
 
+    # Init array of this operand's positions in output line
     if not hasattr(cmd, "arg_pos") or not cmd.arg_pos:
         cmd.arg_pos = [[0, 0] for i in range(UA_MAXOP)]
-    cmd.arg_pos[op_no][0] = len(u_line.getvalue())
 
     op = cmd[op_no]
-    patched = False
-    if op.type == o_imm:
-        if ADDRESS_SPACE.get_arg_prop(cmd.ea, op_no, "type") == o_mem:
-            # if native operand type is immediate value, but it was overriden to be
-            # address/offset, it should be output as such
-            op.addr = op.value
-            op.type = o_mem
-            patched = True
+    op.props = ADDRESS_SPACE.get_arg_prop_dict(cmd.ea, op_no)
+
+    # Record start position of this operand in output line
+    cmd.arg_pos[op_no][0] = len(u_line.getvalue())
 
     _processor.outop(op)
-    if patched:
-        op.type = o_imm
+
+    # Record end position of this operand in output line
     cmd.arg_pos[op_no][1] = len(u_line.getvalue())
 
 
 def OutValue(op, flags):
     global u_line
 #    print(op, flags)
-    u_line.write(hex(op.value))
+    if flags & OOF_ADDR:
+        val = op.addr
+    else:
+        val = op.value
+    # Undefined symbol value
+    if isinstance(val, str):
+        u_line.write(val)
+        return
+    subtype = op.props.get("subtype")
+    if subtype == engine.IMM_ADDR:
+        out_name_expr(op, val, BADADDR)
+    elif subtype == engine.IMM_UDEC:
+        u_line.write(str(val))
+    else:
+        u_line.write(hex(val))
+
+def OutLong(val, base):
+    global u_line
+    if base == 2:
+        u_line.write(bin(val))
+    elif base == 8:
+        u_line.write(oct(val))
+    elif base == 10:
+        u_line.write(str(val))
+    elif base == 16:
+        u_line.write(hex(val))
+    else:
+        raise NotImplementetError
 
 def out_name_expr(op, ea, offset):
     global u_line
@@ -234,7 +267,7 @@ def out_register(reg):
 def MakeLine(output_buffer):
 #    global cmd
     global _processor
-    _processor.cmd.disasm = output_buffer.getvalue()
+    _processor.cmd.disasm = output_buffer.getvalue().rstrip()
 
 #
 # End of instruction rendition API
@@ -247,23 +280,19 @@ def MakeLine(output_buffer):
 def get_full_byte(ea):
     return ADDRESS_SPACE.get_byte(ea)
 
+# Extension
+def get_full_val(ea, val_sz):
+    return ADDRESS_SPACE.get_data(ea, val_sz)
+
 def ua_add_cref(opoff, ea, flags):
-    try:
-        fl = ADDRESS_SPACE.get_flags(ea)
-    except engine.InvalidAddrException:
-        log.warning("ua_add_cref: Cannot get flags for %x - not adding cref", ea)
-        return
-    if fl == ADDRESS_SPACE.UNK:
-        ADDRESS_SPACE.analisys_stack_push(ea)
-    else:
-        assert fl == ADDRESS_SPACE.CODE, "While adding cref from 0x%x to 0x%x, dest flags are: 0x%x" % (_processor.cmd.ea, ea, fl)
-        pass
+    ADDRESS_SPACE.analisys_stack_push(ea, flags == fl_CN)
     if flags == fl_JN:
         ADDRESS_SPACE.make_auto_label(ea)
         ADDRESS_SPACE.add_xref(_processor.cmd.ea, ea, "j")
     elif flags == fl_CN:
         ADDRESS_SPACE.make_label("fun_", ea)
         ADDRESS_SPACE.add_xref(_processor.cmd.ea, ea, "c")
+        ADDRESS_SPACE.make_func(ea, None)
 
 
 def ua_dodata2(opoff, ea, dtype):
@@ -276,9 +305,37 @@ def ua_add_dref(opoff, ea, access):
     ADDRESS_SPACE.add_xref(_processor.cmd.ea, ea, access)
     pass
 
+Q_jumps = 1
+
+def QueueMark(type, ea):
+    if type == Q_jumps:
+        ADDRESS_SPACE.add_issue(ea, "Indirect jump")
+    else:
+        assert 0
+
 #
 # End of Address space access API
 #
+
+#
+# Instruction operands API
+#
+
+REF_OFF32 = 2
+
+# TODO: ref_addr is extension
+def op_offset(ea, op_no, reftype, ref_addr):
+    ADDRESS_SPACE.make_arg_offset(ea, op_no, ref_addr)
+
+def is_offset(ea, op_no):
+    return ADDRESS_SPACE.get_arg_prop(ea, op_no, "subtype") == engine.IMM_ADDR
+
+
+#
+# End of Instruction operands API
+#
+
+
 
 # Interfacing
 
