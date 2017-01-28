@@ -1,12 +1,19 @@
 import string
 
 
+def bidict(d):
+    for k in list(d.keys()):
+        v = d[k]
+        d[v] = k
+    return d
+
+
 def get_word_at_pos(str, pos):
     if pos < 0:
         return None
     if pos >= len(str):
         pos = len(str) - 1
-    word_chars = string.ascii_letters + string.digits + "._"
+    word_chars = string.ascii_letters + string.digits + "._+"
     if str[pos] not in word_chars:
         return None
     beg = pos

@@ -17,12 +17,12 @@
 import sys
 import binascii
 import json
+import bisect
 import logging as log
 
 from rangeset import RangeSet
 
 import idaapi
-import idc
 
 #
 # ScratchABit API and code
@@ -34,12 +34,8 @@ PROPS = 2
 BYTES = 3
 FLAGS = 4
 
-IMM_UHEX = None
-IMM_SHEX = "shex"
-IMM_UDEC = "udec"
-IMM_SDEC = "sdec"
-IMM_CHAR = "chr"
-IMM_ADDR = "addr"
+from .defs import *
+
 
 def str_area(area):
     if not area:
@@ -81,7 +77,11 @@ class Function:
 
     def get_end_method(self):
         if self.end is not None:
-            return "as set by loader (detected: 0x%x)" % (self.ranges.bounds()[1] - 1)
+            bounds = self.ranges.bounds()
+            addr = "?"
+            if bounds:
+                addr = "0x%x" % (self.ranges.bounds()[1] - 1)
+            return "as set by loader (detected: %s)" % addr
         return "as detected"
 
 class AddressSpace:
@@ -96,6 +96,9 @@ class AddressSpace:
 
     def __init__(self):
         self.area_list = []
+        # List of subareas and bianry search index for it
+        self.subarea_list = []
+        self.subarea_search = []
         # Map from referenced addresses to their properties. Among them:
         # "args":
         # Properties of instruction's args; at the very least, this should
@@ -116,6 +119,12 @@ class AddressSpace:
         self.issues = {}
         # Cached last accessed area
         self.last_area = None
+        # Cached function start addresses
+        self.func_starts = None
+        # Map from func_starts's indexes to function objects
+        self.func_starts_arr = []
+        # True during loading stage, False during UI interaction stage
+        self.is_loading = False
 
     # Memory Area API
 
@@ -218,6 +227,14 @@ class AddressSpace:
             area[BYTES][off + i] = data & 0xff
             data >>= 8
 
+    # Convenience function for plugins
+    def memcpy(self, dst, src, sz):
+        for i in range(sz):
+            b = self.get_byte(src)
+            self.set_byte(dst, b)
+            src += 1
+            dst += 1
+
     # Binary Data Flags API
 
     def get_flags(self, addr, mask=0x7f):
@@ -248,14 +265,19 @@ class AddressSpace:
     @classmethod
     def adjust_offset_reverse(cls, off, area):
         flags = area[FLAGS]
-        org_flags = flags[off]
+        if flags[off] == cls.FILL:
+            while off > 0:
+                if flags[off] != cls.FILL:
+                    off += 1
+                    break
+                off -= 1
+            return off
+
         while off > 0:
-            if flags[off] in (cls.CODE_CONT, cls.DATA_CONT, cls.FILL):
+            if flags[off] in (cls.CODE_CONT, cls.DATA_CONT):
                 off -= 1
             else:
                 break
-        if org_flags == cls.FILL and off > 0:
-            off += 1
         return off
 
     def adjust_addr_reverse(self, addr):
@@ -289,13 +311,16 @@ class AddressSpace:
         for i in range(sz - 1):
             area_byte_flags[off + 1 + i] |= self.DATA_CONT
 
-    def make_data_array(self, addr, sz, num_items):
+    def make_data_array(self, addr, sz, num_items, prefix=""):
         # Make a data array. First-class arrays are not supported so far,
         # so just mark data units sequentially
-        self.set_comment(addr, "Array, num %s: %d" % ("bytes" if sz == 1 else "items", num_items))
+        self.append_comment(addr, "%sArray, num %s: %d" % (prefix, "bytes" if sz == 1 else "items", num_items))
         for i in range(num_items):
             self.make_data(addr, sz)
             addr += sz
+
+    def make_filler(self, addr, sz):
+        self.set_flags(addr, sz, self.FILL, self.FILL)
 
     # Address properties API
 
@@ -362,6 +387,12 @@ class AddressSpace:
         off, area = self.addr2area(ea)
         if area is None:
             self.add_area(ea, ea, {"name": "autocreated to host %s label" % label})
+        if self.is_loading:
+            existing = self.get_addr_prop(ea, "label")
+            if existing is not None and not isinstance(existing, int):
+                log.warn("Duplicate label for %x: %s (existing: %s)" % (ea, label, existing))
+                self.append_comment(ea, "Another label: " + label)
+                return
         self.set_addr_prop(ea, "label", label)
         self.labels_rev[label] = ea
 
@@ -376,6 +407,8 @@ class AddressSpace:
                 l += "__%d" % cnt
             if l not in self.labels_rev:
                 self.set_label(ea, l)
+                if self.is_loading and cnt > 0:
+                    self.append_comment(ea, "Original label: " + label)
                 return l
             cnt += 1
 
@@ -402,6 +435,12 @@ class AddressSpace:
         return comm
 
     def set_comment(self, ea, comm):
+        self.set_addr_prop(ea, "comm", comm)
+
+    def append_comment(self, ea, comm):
+        existing = self.get_comment(ea)
+        if existing is not None:
+            comm = existing + "\n" + comm
         self.set_addr_prop(ea, "comm", comm)
 
     # (Pseudo)instruction Argument Properties API
@@ -455,6 +494,9 @@ class AddressSpace:
         if not self.get_xrefs(ref_addr):
             self.del_auto_label(ref_addr)
 
+    def is_arg_offset(self, insn_addr, arg_no):
+        old_subtype = self.get_arg_prop(insn_addr, arg_no, "subtype")
+        return old_subtype == IMM_ADDR
 
     # Xref API
 
@@ -483,6 +525,8 @@ class AddressSpace:
 
         if to_ea_excl is not None:
             self.set_addr_prop(to_ea_excl, "fun_e", f)
+        # Reset cache
+        self.func_starts = None
         return f
 
     def is_func(self, ea):
@@ -502,12 +546,50 @@ class AddressSpace:
     # Look up function containing address
     def lookup_func(self, ea):
         # TODO: cache func ranges, use binary search instead
-        for start, props in self.addr_map.items():
+        if self.func_starts is None:
+            self.func_starts = []
+            self.func_starts_arr = []
+            for start, props in sorted(self.addr_map.items()):
+                func = props.get("fun_s")
+                if func:
+                    self.func_starts.append(start)
+                    self.func_starts_arr.append(func)
+
+        i = bisect.bisect_right(self.func_starts, ea)
+        if i:
+            func = self.func_starts_arr[i - 1]
+            end = func.get_end()
+            if end and func.start <= ea < end:
+                return func
+        return None
+
+    # Get all functions
+    def get_funcs(self):
+        for addr, props in self.addr_map.items():
             func = props.get("fun_s")
-            if func and ea >= start:
-                end = func.get_end()
-                if end is not None and ea < end:
-                    return func
+            if func:
+                yield (addr, func)
+
+    # Memory Subarea API
+
+    def add_subarea(self, start, end, name):
+        log.debug("add_subarea(%x, %x, %s)", start, end, name)
+        self.subarea_list.append((start, end, name))
+        self.subarea_search.append(start)
+
+    # Call this once all add_subarea() calls were made
+    def finish_subareas(self):
+        self.subarea_list.sort()
+        self.subarea_search.sort()
+
+    # Look up subarea containing address
+    def lookup_subarea(self, ea):
+        i = bisect.bisect_right(self.subarea_search, ea)
+        if i:
+            area = self.subarea_list[i - 1]
+            if area[0] <= ea <= area[1]:
+                return area
+        return None
 
     # Issues API
 
@@ -522,24 +604,43 @@ class AddressSpace:
 
     # Persistence API
 
+    def save_area(self, stream, area):
+        stream.write("%08x %08x\n" % (area[START], area[END]))
+        flags = area[FLAGS]
+        i = 0
+        while True:
+            chunk = flags[i:i + 32]
+            if not chunk:
+                break
+            stream.write(str(binascii.hexlify(chunk), 'utf-8') + "\n")
+            i += 32
+        stream.write("\n")
+
+
     def save_areas(self, stream):
         for a in self.area_list:
-            stream.write("%08x %08x\n" % (a[START], a[END]))
-            flags = a[FLAGS]
-            i = 0
-            while True:
-                chunk = flags[i:i + 32]
-                if not chunk:
-                    break
-                stream.write(str(binascii.hexlify(chunk), 'utf-8') + "\n")
-                i += 32
-            stream.write("\n")
+            self.save_area(stream, a)
 
 
-    def save_addr_props(self, stream):
+    def save_addr_props(self, prefix):
+        areas = self.area_list
+        area_i = 0
+        stream = open(prefix + ".%08x" % areas[area_i][START], "w")
+        area_end = areas[area_i][END]
         stream.write("header:\n")
         stream.write(" version: 1.0\n")
         for addr, props in sorted(self.addr_map.items()):
+                    if addr > area_end:
+                        stream.close()
+                        area_i += 1
+                        while addr > areas[area_i][END]:
+                            area_i += 1
+                        assert addr >= areas[area_i][START]
+                        stream = open(prefix + ".%08x" % areas[area_i][START], "w")
+                        #stream.write("addr=%x area_end=%x\n" % (addr, area_end))
+                        area_end = areas[area_i][END]
+                        stream.write("header:\n")
+                        stream.write(" version: 1.0\n")
                     # If entry has just fun_e data, skip it
                     if len(props) == 1 and "fun_e" in props:
                         continue
@@ -610,7 +711,7 @@ class AddressSpace:
                     props["label"] = val
                     self.labels_rev[val] = addr
                 elif key == "cmnt":
-                    props["comm"] = val[1:-1]
+                    props["comm"] = val[1:-1].replace("\\n", "\n")
                 elif key == "fn_end":
                     if val == "'?'":
                         end = None
@@ -618,8 +719,9 @@ class AddressSpace:
                         end = int(val, 0)
                     f = Function(addr, end)
                     props["fun_s"] = f
-                    if end is not None:
-                        self.addr_map[end] = {"fun_e": f}
+                    # Handled by finish_func() below
+                    #if end is not None:
+                    #    self.addr_map[end] = {"fun_e": f}
                 elif key == "fn_ranges":
                     if val != "[]":
                         assert val.startswith("[[") and val.endswith("]]"), val
@@ -628,6 +730,9 @@ class AddressSpace:
                         for r in val.split("], ["):
                             r = [int(x, 0) for x in r.split(",")]
                             f.add_range(*r)
+                        # Now, call finish func to set func end address, either from
+                        # fn_end or fn_ranges
+                        finish_func(f)
 
                 elif key == "args":
                     arg_props = {}
@@ -664,29 +769,35 @@ class AddressSpace:
 
             self.addr_map[addr] = props
 
+    def load_area(self, stream, area):
+        l = stream.readline()
+        vals = [int(v, 16) for v in l.split()]
+        assert area[START] == vals[0] and area[END] == vals[1]
+        flags = area[FLAGS]
+        i = 0
+        while True:
+            l = stream.readline().rstrip()
+            if not l:
+                break
+            l = binascii.unhexlify(l)
+            flags[i:i + len(l)] = l
+            i += len(l)
+
     def load_areas(self, stream):
         for a in self.area_list:
-            l = stream.readline()
-            vals = [int(v, 16) for v in l.split()]
-            assert a[START] == vals[0] and a[END] == vals[1]
-            flags = a[FLAGS]
-            i = 0
-            while True:
-                l = stream.readline().rstrip()
-                if not l:
-                    break
-                l = binascii.unhexlify(l)
-                flags[i:i + len(l)] = l
-                i += len(l)
+            self.load_area(stream, a)
 
 
     # Hack for idaapi interfacing
     # TODO: should go to "Analysis" object
-    def analisys_stack_push(self, ea, is_call=True):
+    def analisys_stack_push(self, ea, flow_flag=idaapi.fl_JN):
         global analisys_stack_branches, analisys_stack_calls
+        global analisys_stack_returns, analysis_current_func
         # If we know something is func (e.g. from loader), jump
         # to it means tail-call.
-        if is_call or self.is_func(ea):
+        if flow_flag == idaapi.fl_RET_FROM_CALL:
+            analisys_stack_returns.append((ea, analysis_current_func))
+        elif flow_flag == idaapi.fl_CN or self.is_func(ea):
             analisys_stack_calls.append(ea)
         else:
             analisys_stack_branches.append(ea)
@@ -701,7 +812,9 @@ def set_processor(p):
 
 
 analisys_stack_calls = []
+analisys_stack_returns = []
 analisys_stack_branches = []
+analysis_current_func = None
 
 def add_entrypoint(ea, as_func=True):
     if as_func:
@@ -723,30 +836,48 @@ def finish_func(f):
             ADDRESS_SPACE.set_func_end(f, end)
 
 def analyze(callback=lambda cnt:None):
+    global analysis_current_func
     cnt = 0
     limit = 1000000
-    current_func = None
+    analysis_current_func = None
     while limit:
         if analisys_stack_branches:
             ea = analisys_stack_branches.pop()
             fl = ADDRESS_SPACE.get_flags(ea, 0xff)
-            if current_func:
+
+            if fl == ADDRESS_SPACE.CODE | ADDRESS_SPACE.FUNC:
+                fun = ADDRESS_SPACE.get_func_start(ea)
+                if fun:
+                    log.warn("Jump to (or flow into) a function at 0x%x detected" % ea)
+
+            if analysis_current_func:
                 if fl == ADDRESS_SPACE.CODE | ADDRESS_SPACE.FUNC:
                     continue
-                assert fl in (ADDRESS_SPACE.CODE, ADDRESS_SPACE.UNK)
+                if fl not in (ADDRESS_SPACE.CODE, ADDRESS_SPACE.UNK):
+                    log.warn("Unexpected flags 0x%x at 0x%x while tracing code branch, skipping it", fl, ea)
+                    ADDRESS_SPACE.add_issue(ea, "Jump/flow into non-code")
+                    continue
             else:
                 if fl != ADDRESS_SPACE.UNK:
+                    if fl != ADDRESS_SPACE.CODE:
+                        ADDRESS_SPACE.add_issue(ea, "Jump/flow into non-code")
                     continue
         elif analisys_stack_calls:
-            finish_func(current_func)
+            finish_func(analysis_current_func)
+            analysis_current_func = None
             ea = analisys_stack_calls.pop()
             fun = ADDRESS_SPACE.get_func_start(ea)
             if fun.get_ranges():
                 continue
             log.info("Starting analysis of function 0x%x" % ea)
-            current_func = ADDRESS_SPACE.make_func(ea)
+            analysis_current_func = ADDRESS_SPACE.make_func(ea)
+        elif analisys_stack_returns:
+            ea, analysis_current_func = analisys_stack_returns.pop()
+            #log.debug("Restarting analysis of call return at 0x%x (fl=%x)", ea, ADDRESS_SPACE.get_flags(ea, 0xff))
+            analisys_stack_branches.append(ea)
+            continue
         else:
-            finish_func(current_func)
+            finish_func(analysis_current_func)
             break
         init_cmd(ea)
         try:
@@ -759,8 +890,8 @@ def analyze(callback=lambda cnt:None):
         if insn_sz:
             if not _processor.emu():
                 assert False
-            if current_func:
-                current_func.add_insn(ea, insn_sz)
+            if analysis_current_func:
+                analysis_current_func.add_insn(ea, insn_sz)
                 ADDRESS_SPACE.make_code(ea, insn_sz, ADDRESS_SPACE.FUNC)
             else:
                 ADDRESS_SPACE.make_code(ea, insn_sz)
@@ -907,12 +1038,6 @@ class Instruction(idaapi.insn_t, DisasmObj):
             return mem
         return imm
 
-    def num_operands(self):
-        for i, op in self._operands:
-            if op.type == o_void:
-                return i + 1
-        return UA_MAXOP
-
 
 class Data(DisasmObj):
 
@@ -1016,7 +1141,15 @@ class Xref(DisasmObj):
         self.type = type
 
     def render(self):
-        s = (" " * idaapi.DEFAULT_XREF_INDENT) + "; xref: 0x%x %s" % (self.from_addr, self.type)
+        func = ADDRESS_SPACE.lookup_func(self.from_addr)
+        extra = ""
+        if func:
+            extra = ADDRESS_SPACE.get_label(func.start)
+            off = self.from_addr - func.start
+            if off != 0:
+                extra += "+0x%x" % off
+            extra = " (%s)" % extra
+        s = (" " * idaapi.DEFAULT_XREF_INDENT) + "; xref: %s 0x%x" % (self.type, self.from_addr) + extra
         self.cache = s
         return s
 
@@ -1066,9 +1199,9 @@ def render_partial_around(addr, subno, context_lines):
             # Reached beginning of address space, just set as such
             off = 0
     assert off >= 0
-    log.debug("render_partial_around: 0x%x, %s", off, str_area(area))
+    log.debug("render_partial_around: off=0x%x, %s", off, str_area(area))
     off = ADDRESS_SPACE.adjust_offset_reverse(off, area)
-    log.debug("render_partial_around adjusted: 0x%x, %s", off, str_area(area))
+    log.debug("render_partial_around adjusted: off=0x%x, %s", off, str_area(area))
     model = Model(addr, subno)
     render_partial(model, ADDRESS_SPACE.area_list.index(area), off, context_lines, addr)
     log.debug("render_partial_around model done, lines: %d", len(model.lines()))
@@ -1100,7 +1233,7 @@ def render_partial(model, area_no, offset, num_lines, target_addr=-1):
         if start:
             i = offset
             start = False
-        else:
+        if i == 0:
             model.add_line(a[START], Literal(a[START], "; Start of 0x%x area (%s)" % (a[START], a[PROPS].get("name", "noname"))))
         bytes = a[BYTES]
         flags = a[FLAGS]
@@ -1116,7 +1249,7 @@ def render_partial(model, area_no, offset, num_lines, target_addr=-1):
             props = ADDRESS_SPACE.get_addr_prop_dict(addr)
             func = props.get("fun_s")
             if func:
-                model.add_line(addr, Literal(addr, "; Start of '%s' function" % ADDRESS_SPACE.get_label(func.start)))
+                model.add_line(addr, Literal(addr, "; Start of function '%s'" % ADDRESS_SPACE.get_label(func.start)))
 
             xrefs = props.get("xrefs")
             if xrefs:
@@ -1166,7 +1299,7 @@ def render_partial(model, area_no, offset, num_lines, target_addr=-1):
                 _processor.out()
                 i += sz
             else:
-                model.add_line(addr, Literal(addr, "; UNEXPECTED value: %02x flags: %02x" % (bytes[i], f)))
+                out = Literal(addr, "; UNEXPECTED value: %02x flags: %02x" % (bytes[i], f))
                 sz = 1
                 i += 1
                 assert 0, "@%08x flags=%x" % (addr, f)
@@ -1174,13 +1307,13 @@ def render_partial(model, area_no, offset, num_lines, target_addr=-1):
             comm = props.get("comm")
             if comm:
                 comm_indent = " " * (out.content_len() + len(out.indent) + 2)
-                out.comment = "  ; " + comm.split("|", 1)[0]
+                out.comment = "  ; " + comm.split("\n", 1)[0]
 
             model.add_line(addr, out)
             #sys.stdout.write(out + "\n")
 
             if comm:
-                for comm_l in comm.split("|")[1:]:
+                for comm_l in comm.split("\n")[1:]:
                     comm_obj = Literal(addr, "; " + comm_l)
                     comm_obj.indent = comm_indent
                     model.add_line(addr, comm_obj)
@@ -1189,7 +1322,7 @@ def render_partial(model, area_no, offset, num_lines, target_addr=-1):
             next_props = ADDRESS_SPACE.get_addr_prop_dict(next_addr)
             func_end = next_props.get("fun_e")
             if func_end:
-                model.add_line(addr, Literal(addr, "; End of '%s' function (%s)" % (
+                model.add_line(addr, Literal(addr, "; End of function '%s' (%s)" % (
                     ADDRESS_SPACE.get_label(func_end.start), func_end.get_end_method()
                 )))
 
@@ -1213,6 +1346,8 @@ def flag2char(f):
         return "D"
     elif f == AddressSpace.DATA_CONT:
         return "d"
+    elif f == AddressSpace.STR:
+        return "A"
     elif f == AddressSpace.FILL:
         return "-"
     else:
@@ -1229,4 +1364,3 @@ def print_address_map():
 
 
 idaapi.set_address_space(ADDRESS_SPACE)
-idc.set_address_space(ADDRESS_SPACE)

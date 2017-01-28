@@ -18,7 +18,7 @@ import sys
 from io import StringIO
 import logging as log
 
-import engine
+from scratchabit import defs
 
 
 # Data types
@@ -88,6 +88,15 @@ CF_JUMP = 4  # Not just a jump, indirect jump (or call)!
 fl_CN = 1  # "call near"
 fl_JN = 2  # "jump near"
 fl_F = 3   # "ordinary flow"
+# ScratchABit extensions:
+# Return address from a call. Next instruction from a call, whenever possible,
+# Should use this flag instead of fl_F. This is because there's no guarantee
+# that a call will return, so such code paths need to be treated with different
+# priority than "next instruction" and "jump" code paths.
+fl_RET_FROM_CALL = 10
+# Sane names
+fl_CALL = fl_CN
+fl_JUMP = fl_JN
 
 # Data references
 dr_R = "r"
@@ -136,9 +145,17 @@ class insn_t:
     def __getitem__(self, i):
         return self._operands[i]
 
+    # ScratchABit extension
+    def num_operands(self):
+        for i, op in enumerate(self._operands):
+            if op.type == o_void:
+                return i
+        return UA_MAXOP
+
     def __repr__(self):
-        #return str(self.__dict__)
-        return "insn_t(ea=%x, sz=%d, id=%d, %s, %s)" % (self.ea, self.size, self.itype, self.disasm, self._operands)
+        #return "insn_t(ea=%x, sz=%d, id=%d, %r, %s)" % (self.ea, self.size, self.itype, self.disasm, self._operands)
+        used_operands = self._operands[0:self.num_operands()]
+        return "insn_t(ea=%x, sz=%d, id=%d, %r, %s)" % (self.ea, self.size, self.itype, self.disasm, used_operands)
 
 
 class processor_t:
@@ -227,9 +244,9 @@ def OutValue(op, flags):
         u_line.write(val)
         return
     subtype = op.props.get("subtype")
-    if subtype == engine.IMM_ADDR:
+    if subtype == defs.IMM_ADDR:
         out_name_expr(op, val, BADADDR)
-    elif subtype == engine.IMM_UDEC:
+    elif subtype == defs.IMM_UDEC:
         u_line.write(str(val))
     else:
         u_line.write(hex(val))
@@ -285,13 +302,17 @@ def get_full_val(ea, val_sz):
     return ADDRESS_SPACE.get_data(ea, val_sz)
 
 def ua_add_cref(opoff, ea, flags):
-    ADDRESS_SPACE.analisys_stack_push(ea, flags == fl_CN)
+    ADDRESS_SPACE.analisys_stack_push(ea, flags)
     if flags == fl_JN:
         ADDRESS_SPACE.make_auto_label(ea)
         ADDRESS_SPACE.add_xref(_processor.cmd.ea, ea, "j")
     elif flags == fl_CN:
         ADDRESS_SPACE.make_label("fun_", ea)
         ADDRESS_SPACE.add_xref(_processor.cmd.ea, ea, "c")
+        fl = ADDRESS_SPACE.get_flags(ea, 0xff)
+        if fl & ADDRESS_SPACE.FUNC:
+            if not ADDRESS_SPACE.is_func(ea):
+                log.warn("Address 0x%x calls inside another function: 0x%x", _processor.cmd.ea, ea)
         ADDRESS_SPACE.make_func(ea, None)
 
 
@@ -328,7 +349,7 @@ def op_offset(ea, op_no, reftype, ref_addr):
     ADDRESS_SPACE.make_arg_offset(ea, op_no, ref_addr)
 
 def is_offset(ea, op_no):
-    return ADDRESS_SPACE.get_arg_prop(ea, op_no, "subtype") == engine.IMM_ADDR
+    return ADDRESS_SPACE.get_arg_prop(ea, op_no, "subtype") == defs.IMM_ADDR
 
 
 #

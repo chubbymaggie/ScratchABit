@@ -9,6 +9,13 @@ from pyelftools.elftools.elf.sections import SymbolTableSection
 from pyelftools.elftools.elf.relocation import RelocationSection
 from pyelftools.elftools.common.exceptions import ELFError
 
+import idaapi
+
+
+# Whether to add comments of relocs pointing to addresses.
+# Useful for debugging loader, but mostly a noise afterwards.
+RELOC_COMMENTS = False
+
 MACH_MAP = {
     "EM_386": "x86",
     "EM_X86_64": "x86",
@@ -103,7 +110,7 @@ def load_segments(aspace, elffile):
                     aspace.make_unique_label(s["st_value"], str(s.name, "utf-8"))
 
                     if s["st_info"]["type"] == "STT_FUNC":
-                        aspace.analisys_stack_push(s["st_value"])
+                        aspace.analisys_stack_push(s["st_value"], idaapi.fl_CALL)
                     if s["st_info"]["type"] == "STT_OBJECT":
                         # TODO: Set as data of given s["st_size"]
                         pass
@@ -121,11 +128,11 @@ def load_segments(aspace, elffile):
 
                     aspace.set_label(d_ptr + wordsz, "ELF.CUR_OBJ")
                     aspace.make_data(d_ptr + wordsz, wordsz)
-                    aspace.set_comment(d_ptr + wordsz, "Identifier of this ELF object")
+                    aspace.append_comment(d_ptr + wordsz, "Identifier of this ELF object")
 
                     aspace.set_label(d_ptr + wordsz * 2, "ELF.SYM_LOOKUP")
                     aspace.make_data(d_ptr + wordsz * 2, wordsz)
-                    aspace.set_comment(d_ptr + wordsz * 2, "Dynamic linker routine for symbol lookup")
+                    aspace.append_comment(d_ptr + wordsz * 2, "Dynamic linker routine for symbol lookup")
 
                 elif tag['d_tag'] == 'DT_JMPREL':
                     aspace.set_label(d_ptr, "ELF.JMPREL")
@@ -176,7 +183,7 @@ def load_segments(aspace, elffile):
                     sym = symtab[reloc['r_info_sym']]
                     #print(reloc, sym.name, sym.entry)
                     symname = str(sym.name, "utf-8")
-                    aspace.set_comment(pltrel, symname + ".plt")
+                    aspace.append_comment(pltrel, symname + ".plt")
                     aspace.make_arg_offset(pltrel, 0, aspace.get_data(pltrel, wordsz))
 
                     got_addr = reloc["r_offset"]
@@ -250,7 +257,7 @@ def load_sections(aspace, elffile):
                 aspace.make_unique_label(sym["st_value"] + sec_start, symname)
 
                 if sym["st_info"]["type"] == "STT_FUNC":
-                    aspace.analisys_stack_push(sym["st_value"] + sec_start)
+                    aspace.analisys_stack_push(sym["st_value"] + sec_start, idaapi.fl_CALL)
                     if sym["st_size"]:
                         aspace.make_func(sym["st_value"] + sec_start, sym["st_value"] + sec_start + sym["st_size"])
                     else:
@@ -303,7 +310,8 @@ def load_sections(aspace, elffile):
             raddr = target_sec_addr + reloc["r_offset"]
             rel_type = reloc_types.get(reloc["r_info_type"], "reltype%d" % reloc["r_info_type"])
 
-            aspace.set_comment(raddr, "%s: %s" % (rel_type, symname))
+            if RELOC_COMMENTS:
+                aspace.append_comment(raddr, "%s: %s" % (rel_type, symname))
 
             if rel_type == "R_XTENSA_32":
                 aspace.make_data(raddr, wordsz)
@@ -376,16 +384,12 @@ def load_sections(aspace, elffile):
             start, size, flags = prop_arr[i:i+3]
             #print("Xtensa prop entry: %08x(%x) %x" % (start, size, flags))
             if flags & XTENSA_PROP_INSN:
-                aspace.analisys_stack_push(start, is_call=False)
+                aspace.analisys_stack_push(start)
             if flags & XTENSA_PROP_DATA:
-                c = aspace.get_comment(start)
-                if c:
-                    c += " ; "
-                else:
-                    c = ""
+                c = aspace.get_comment(start) or ""
                 if size != 0 or "XTENSA_PROP_DATA" not in c:
-                    c += "XTENSA_PROP_DATA (%d)" % size
-                    aspace.set_comment(start, c)
+                    if RELOC_COMMENTS:
+                        aspace.append_comment(start, "XTENSA_PROP_DATA (%d)" % size)
                     # Don't trust XTENSA_PROP_DATA with size=0
                     # For linked exe, there were cases when such
                     # pointed straight into the code and broke all
@@ -393,7 +397,7 @@ def load_sections(aspace, elffile):
                     #if not size:
                     #    size = 1
                     if size:
-                        aspace.make_data_array(start, 1, size)
+                        aspace.make_data_array(start, 1, size, prefix="xtensa: ")
             if flags & XTENSA_PROP_LITERAL:
                 while size:
                     aspace.make_data(start, wordsz)

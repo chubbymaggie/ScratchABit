@@ -14,7 +14,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
-import engine
+from scratchabit import engine
 import idaapi
 
 
@@ -23,7 +23,7 @@ SEGATTR_PERM = 1
 
 def GetSegmentAttr(ea, attr):
     assert attr == SEGATTR_PERM
-    off, area = ADDRESS_SPACE.addr2area(addr)
+    off, area = engine.ADDRESS_SPACE.addr2area(addr)
     props = engine.area_props(area)
     ret = 0
     if "R" in props:
@@ -34,8 +34,6 @@ def GetSegmentAttr(ea, attr):
         ret |= idaapi.SEGPERM_EXEC
 
 
-ADDRESS_SPACE = None
-
-def set_address_space(aspace):
-    global ADDRESS_SPACE
-    ADDRESS_SPACE = aspace
+# Make filler
+def MakeAlign(ea, cnt, align):
+    engine.ADDRESS_SPACE.make_filler(ea, cnt)
