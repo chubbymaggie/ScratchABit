@@ -256,10 +256,16 @@ class AddressSpace:
         else:
             return 1
         off += 1
-        while flags[off] == f:
-            off += 1
-            sz += 1
+
+        try:
+            while flags[off] == f:
+                off += 1
+                sz += 1
+        except IndexError:
+            pass
+
         return sz
+
 
     # Taking an offset inside unit, return offset to the beginning of unit
     @classmethod
@@ -303,6 +309,17 @@ class AddressSpace:
         area_byte_flags[off] |= self.CODE | extra_flags
         for i in range(sz - 1):
             area_byte_flags[off + 1 + i] |= self.CODE_CONT
+
+    # Mark instructions in given range as belonging to function
+    def mark_func_bytes(self, addr, sz):
+        self.changed = True
+        off, area = self.addr2area(addr)
+        area_byte_flags = area[FLAGS]
+        for i in range(sz):
+            fl = area_byte_flags[off + i]
+            assert fl in (self.CODE, self.CODE_CONT)
+            if fl == self.CODE:
+                area_byte_flags[off + i] |= self.FUNC
 
     def make_data(self, addr, sz):
         off, area = self.addr2area(addr)
@@ -564,11 +581,14 @@ class AddressSpace:
         return None
 
     # Get all functions
-    def get_funcs(self):
+    def iter_funcs(self):
         for addr, props in self.addr_map.items():
             func = props.get("fun_s")
             if func:
                 yield (addr, func)
+
+    def get_func_list(self):
+        return sorted([self.get_label(addr) for addr, f in self.iter_funcs()])
 
     # Memory Subarea API
 
@@ -630,6 +650,13 @@ class AddressSpace:
         stream.write("header:\n")
         stream.write(" version: 1.0\n")
         for addr, props in sorted(self.addr_map.items()):
+                    # If entry has just fun_e data, skip it. As fun_e is set
+                    # on an address past the last byte of func, this address
+                    # also may not belong to any section, so skipping it
+                    # to start with is helpful.
+                    if len(props) == 1 and "fun_e" in props:
+                        continue
+
                     if addr > area_end:
                         stream.close()
                         area_i += 1
@@ -641,9 +668,6 @@ class AddressSpace:
                         area_end = areas[area_i][END]
                         stream.write("header:\n")
                         stream.write(" version: 1.0\n")
-                    # If entry has just fun_e data, skip it
-                    if len(props) == 1 and "fun_e" in props:
-                        continue
                     stream.write("0x%08x:\n" % addr)
                     fl = self.get_flags(addr)
                     stream.write(" f: %s %02x\n" % (flag2char(fl), fl))

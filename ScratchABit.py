@@ -46,6 +46,7 @@ HEIGHT = 21
 
 MENU_PREFS = 2000
 MENU_PLUGIN = 2001
+MENU_ADD_TO_FUNC = 2002
 
 
 class AppClass:
@@ -92,6 +93,14 @@ class Editor(editor.EditorExt):
                 res += idaapi.fillstr(bin, show_bytes * 2 + 1)
             res += l.indent + l.render()
         super().show_line(res, i)
+
+    def handle_input(self, key):
+        try:
+            return super().handle_input(key)
+        except Exception as ex:
+            self.show_exception(ex)
+            return None
+
 
     def goto_addr(self, to_addr, col=None, from_addr=None):
         if to_addr is None:
@@ -259,6 +268,16 @@ class Editor(editor.EditorExt):
                 return to_addr + addend
 
 
+    def require_non_func(self, fl):
+        if fl & 0x7f != self.model.AS.CODE:
+            self.show_status("Code required")
+            return False
+        if fl & self.model.AS.FUNC:
+            self.show_status("Already a function")
+            return False
+        return True
+
+
     def handle_edit_key(self, key):
         line = self.get_cur_line()
         if key == editor.KEY_ENTER:
@@ -306,11 +325,7 @@ class Editor(editor.EditorExt):
         elif key == b"F":
             addr = self.cur_addr()
             fl = self.model.AS.get_flags(addr, 0xff)
-            if fl & 0x7f != self.model.AS.CODE:
-                self.show_status("Code required")
-                return
-            if fl & self.model.AS.FUNC:
-                self.show_status("Already a function")
+            if not self.require_non_func(fl):
                 return
             self.show_status("Retracing as a function...")
             self.model.AS.make_label("fun_", addr)
@@ -318,6 +333,11 @@ class Editor(editor.EditorExt):
             engine.analyze(self.analyze_status)
             self.update_model()
             self.show_status("Retraced as a function")
+
+        elif key == MENU_ADD_TO_FUNC:
+            addr = self.cur_addr()
+            if actions.add_code_to_func(APP, addr):
+                self.update_model()
 
         elif key == b"d":
             addr = self.cur_addr()
@@ -365,8 +385,11 @@ class Editor(editor.EditorExt):
             if not self.expect_flags(fl, (self.model.AS.UNK,)):
                 return
 
+            off, area = self.model.AS.addr2area(self.cur_addr())
+            # Don't cross area boundaries with filler
+            remaining = area[engine.END] - addr + 1
             sz = 0
-            while True:
+            while remaining:
                 try:
                     fl = self.model.AS.get_flags(addr)
                 except engine.InvalidAddrException:
@@ -379,6 +402,7 @@ class Editor(editor.EditorExt):
                     return
                 sz += 1
                 addr += 1
+                remaining -= 1
             if sz > 0:
                 self.model.AS.make_filler(self.cur_addr(), sz)
                 self.update_model()
@@ -505,35 +529,10 @@ class Editor(editor.EditorExt):
                 status += ", subarea: " + subarea[2]
             self.show_status(status)
         elif key == b"I":
-            L = 5
-            T = 2
-            W = 66
-            H = 20
-            self.dialog_box(L, T, W, H)
-            v = Viewer(L + 1, T + 1, W - 2, H - 2)
-            lines = []
-            for area in self.model.AS.get_areas():
-                props = area[engine.PROPS]
-                lines.append("%08x-%08x %s:" % (area[engine.START], area[engine.END], props.get("name", "noname")))
-                flags = area[engine.FLAGS]
-                last_capital = None
-                l = ""
-                for i in range(len(flags)):
-                    if i % 64 == 0 and l:
-                        lines.append(l)
-                        l = ""
-                    c = engine.flag2char(flags[i])
-                    # For "function's instructions", make continuation byte be
-                    # clearly distinguishable too.
-                    if c == "c" and last_capital == "F":
-                        c = "f"
-                    l += c
-                    if c < "a":
-                        last_capital = c
-                if l:
-                    lines.append(l)
-            v.set_lines(lines)
-            v.loop()
+            from scratchabit import memmap
+            addr = memmap.show(self.model.AS, self.cur_addr())
+            if addr is not None:
+                self.goto_addr(addr, from_addr=self.cur_addr())
             self.redraw()
         elif key == b"W":
             out_fname = "out.lst"
@@ -541,7 +540,7 @@ class Editor(editor.EditorExt):
                 engine.render_partial(actions.TextSaveModel(f, self), 0, 0, 10000000)
             self.show_status("Disassembly listing written: " + out_fname)
         elif key == b"\x17":  # Ctrl+W
-            outfile = actions.write_func(APP, self.cur_addr(), feedback_obj=self)
+            outfile = actions.write_func_by_addr(APP, self.cur_addr(), feedback_obj=self)
             if outfile:
                 self.show_status("Wrote file: %s" % outfile)
         elif key == b"\x15":  # Ctrl+U
@@ -822,7 +821,7 @@ class MainScreen:
         menu_edit = WMenuBox([
             ("Undefined (u)", b"u"), ("Code (c)", b"c"), ("Data (d)", b"d"),
             ("ASCII String (a)", b"a"), ("Filler (f)", b"f"), ("Make label (n)", b"n"),
-            ("Mark function start (F)", b"F"),
+            ("Mark function start (F)", b"F"), ("Add code to function", MENU_ADD_TO_FUNC),
             ("Number/Address (o)", b"o"), ("Hex/dec (h)", b"h"),
         ])
         menu_analysis = WMenuBox([
@@ -839,10 +838,12 @@ class MainScreen:
         ])
         self.menu_bar.permanent = True
 
-    def redraw(self):
+    def redraw(self, allow_cursor=True):
         self.menu_bar.redraw()
         self.e.draw_box(0, 1, self.screen_size[0], self.screen_size[1] - 2)
         self.e.redraw()
+        if allow_cursor:
+            self.e.cursor(True)
 
     def loop(self):
         while 1:
@@ -867,11 +868,7 @@ class MainScreen:
                     self.menu_bar.redraw()
                     continue
 
-                try:
-                    res = self.e.handle_input(key)
-                except Exception as ex:
-                    self.e.show_exception(ex)
-                    res = None
+                res = self.e.handle_input(key)
 
                 if res is not None and res is not True:
                     return res
@@ -991,6 +988,7 @@ if __name__ == "__main__":
         main_screen.e.goto_addr(show_addr)
         Screen.set_screen_redraw(main_screen.redraw)
         main_screen.redraw()
+        main_screen.e.show_status("Press F1 for help, F9 for menus")
         main_screen.loop()
     except:
         log.exception("Unhandled exception")
