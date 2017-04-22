@@ -20,7 +20,7 @@ ScratchABit is released under the terms of GNU General Public License v3
 Requirements/manifesto
 ----------------------
 
-1. Should not be written in an obfuscated language. These includes languages
+1. Should not be written in an obfuscated language. These include languages
 which are too low-level, which allow to access non-initialized variables,
 which don't differentiate between variables and functions/procedures, which
 start array indexes from arbitrary numbers, etc., etc. ScratchABit is
@@ -28,10 +28,9 @@ written in Python (modern version, Python3) for your pleasure and sanity.
 
 2. User interface framework should allow user interaction of the needed
 level, not add dependencies, bloat, issues, and incompatibilities between
-framework's versions. ScratchABit currently uses simple (no color even)
-full-screen text user interface, using ANSI/VT100 terminal escape sequences
-(yes, even curses library was deemed too bloat a dependency to force upon
-users).
+framework's versions. ScratchABit currently uses simple full-screen text
+user interface, using ANSI/VT100 terminal escape sequences (yes, even
+curses library was deemed too bloat a dependency to force upon users).
 
 3. Should leverage easy to use text formats to store "database", to
 facilitate easy reuse and tool writing, and storage in version control
@@ -90,11 +89,11 @@ TODO/Things to decide
 
 * ~~Currently uses multiple files for "database", each storing particular
   type of information. Switch to a single YAML file instead?~~
-* Add color (low priority, (unbloated!) patches welcome).
+* ~~Add color (low priority, (unbloated!) patches welcome).~~
 * ~~Few important UI commands to implement yet for comfortable work.~~ (
   All the most important commands should be there, other functionality is
   expected to be implemented using plugins).
-* Offer to save DB on quit if modified.
+* ~~Offer to save DB on quit if modified.~~
 * Git integration for DB saving.
 * ~~Improve robustness (add exception handler at the main loop level, don't
   abort the application, show to user/log and continue).~~
@@ -118,6 +117,22 @@ it is fully retargettable using IDAPython API plugins. Many plugins are
 available, writing a new plugin is easy. To let users test-drive
 ScratchABit, a very simple (!) X86 processor plugin is included in the
 distribution, using Pymsasid disassembler under the hood.
+
+> Q: Debugger?
+
+A: ScratchABit is dedicated to static analysis and easy support for
+new CPU architectures (just code up an new CPU plugin in Python - you
+can get initial results in few hours). Dynamic analysis wasn't conceived
+to be a core feature and there're no immediate plans to implement it.
+Patches are welcome though.
+
+> Q: Decompiler?
+
+A: There is a related project, called
+[ScratchABlock](https://github.com/pfalcon/ScratchABlock) for deep
+program analysis, transformation and decompilation. It's expected
+that as ScratchABlock matures, some of its functionality will be
+available within ScratchABit (perhaps via plugins).
 
 > Q: I'm not on Linux, how can I run ScratchABit?
 

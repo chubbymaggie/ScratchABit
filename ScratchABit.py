@@ -50,7 +50,14 @@ MENU_ADD_TO_FUNC = 2002
 
 
 class AppClass:
-    pass
+
+    def set_show_bytes(self, show_bytes):
+        self.show_bytes = show_bytes
+        sz = 8 + 1
+        if APP.show_bytes:
+            sz += show_bytes * 2 + 1
+        engine.DisasmObj.LEADER_SIZE = sz
+
 
 APP = AppClass()
 
@@ -63,13 +70,14 @@ def disasm_one(p):
     p.cmd.size = 0
 
 
-class Editor(editor.EditorExt):
+class DisasmViewer(editor.EditorExt):
 
     def __init__(self, *args):
         super().__init__(*args)
         self.model = None
         self.addr_stack = []
         self.search_str = ""
+        self.def_color = C_PAIR(C_CYAN, C_BLUE)
 
     def set_model(self, model):
         self.model = model
@@ -79,7 +87,7 @@ class Editor(editor.EditorExt):
         self.top_line = sys.maxsize
 
     def show_line(self, l, i):
-        global show_bytes
+        show_bytes = APP.show_bytes
         res = l
         if not isinstance(l, str):
             res = "%08x " % l.ea
@@ -92,7 +100,22 @@ class Editor(editor.EditorExt):
                         bin += "+"
                 res += idaapi.fillstr(bin, show_bytes * 2 + 1)
             res += l.indent + l.render()
+
+        COLOR_MAP = {
+            engine.Label: C_PAIR(C_GREEN, C_BLUE),
+            engine.AreaWrapper: C_PAIR(C_YELLOW, C_BLUE),
+            engine.FunctionWrapper: C_PAIR(C_B_YELLOW, C_BLUE),
+            engine.Xref: C_PAIR(C_MAGENTA, C_BLUE),
+            engine.Unknown: C_PAIR(C_WHITE, C_BLUE),
+            engine.Data: C_PAIR(C_MAGENTA, C_BLUE),
+            engine.String: C_PAIR(C_B_MAGENTA, C_BLUE),
+            engine.Fill: C_PAIR(C_B_BLUE, C_BLUE),
+        }
+        c = COLOR_MAP.get(type(l), self.def_color)
+        self.attr_color(c)
         super().show_line(res, i)
+        self.attr_reset()
+
 
     def handle_input(self, key):
         try:
@@ -277,8 +300,62 @@ class Editor(editor.EditorExt):
             return False
         return True
 
+    #
+    # UI action handlers
+    #
+
+    def action_goto(self):
+        d = Dialog(4, 4, title="Go to")
+        d.add(1, 1, WLabel("Label/addr:"))
+        entry = WAutoComplete(20, "", self.model.AS.get_label_list())
+        entry.popup_h = 12
+        entry.finish_dialog = ACTION_OK
+        d.add(13, 1, entry)
+        d.add(1, 2, WLabel("Press Down to auto-complete"))
+        res = d.loop()
+        self.redraw()
+
+        if res == ACTION_OK:
+            value = entry.get_text()
+            if '0' <= value[0] <= '9':
+                addr = int(value, 0)
+            else:
+                addr = self.model.AS.resolve_label(value)
+            self.goto_addr(addr, from_addr=self.cur_addr())
+
+
+    def action_make_ascii(self):
+        addr = self.cur_addr()
+        fl = self.model.AS.get_flags(addr)
+        if not self.expect_flags(fl, (self.model.AS.DATA, self.model.AS.UNK)):
+            return
+        sz = 0
+        label = "s_"
+        while True:
+            b = self.model.AS.get_byte(addr)
+            fl = self.model.AS.get_flags(addr)
+            if not (0x20 <= b <= 0x7e or b in (0x0a, 0x0d)):
+                if b == 0:
+                    sz += 1
+                break
+            if fl not in (self.model.AS.UNK, self.model.AS.DATA, self.model.AS.DATA_CONT):
+                break
+            c = chr(b)
+            if c < '0' or c in string.punctuation:
+                c = '_'
+            label += c
+            addr += 1
+            sz += 1
+        if sz > 0:
+            self.model.AS.set_flags(self.cur_addr(), sz, self.model.AS.STR, self.model.AS.DATA_CONT)
+            self.model.AS.make_unique_label(self.cur_addr(), label)
+            self.update_model()
+
 
     def handle_edit_key(self, key):
+        if key in ACTION_MAP:
+            return ACTION_MAP[key](self)
+
         line = self.get_cur_line()
         if key == editor.KEY_ENTER:
             line = self.get_cur_line()
@@ -310,7 +387,12 @@ class Editor(editor.EditorExt):
                 self.show_status("Returning")
                 self.goto_addr(self.addr_stack.pop())
         elif key == b"q":
-            return editor.KEY_QUIT
+            res = ACTION_OK
+            if self.model.AS.changed:
+                res = DConfirmation("There're unsaved changes. Quit?").result()
+            if res == ACTION_OK:
+                return editor.KEY_QUIT
+            self.redraw()
         elif key == b"\x1b[5;5~":  # Ctrl+PgUp
             self.goto_addr(self.model.AS.min_addr(), from_addr=line.ea)
         elif key == b"\x1b[6;5~":  # Ctrl+PgDn
@@ -353,32 +435,6 @@ class Editor(editor.EditorExt):
                 if sz > 4: sz = 1
                 self.model.AS.set_flags(addr, sz, self.model.AS.DATA, self.model.AS.DATA_CONT)
             self.update_model()
-        elif key == b"a":
-            addr = self.cur_addr()
-            fl = self.model.AS.get_flags(addr)
-            if not self.expect_flags(fl, (self.model.AS.DATA, self.model.AS.UNK)):
-                return
-            sz = 0
-            label = "s_"
-            while True:
-                b = self.model.AS.get_byte(addr)
-                fl = self.model.AS.get_flags(addr)
-                if not (0x20 <= b <= 0x7e or b in (0x0a, 0x0d)):
-                    if b == 0:
-                        sz += 1
-                    break
-                if fl not in (self.model.AS.UNK, self.model.AS.DATA, self.model.AS.DATA_CONT):
-                    break
-                c = chr(b)
-                if c < '0' or c in string.punctuation:
-                    c = '_'
-                label += c
-                addr += 1
-                sz += 1
-            if sz > 0:
-                self.model.AS.set_flags(self.cur_addr(), sz, self.model.AS.STR, self.model.AS.DATA_CONT)
-                self.model.AS.make_unique_label(self.cur_addr(), label)
-                self.update_model()
         elif key == b"f":
             addr = self.cur_addr()
             fl = self.model.AS.get_flags(addr)
@@ -474,24 +530,6 @@ class Editor(editor.EditorExt):
                     return
                 break
             self.redraw()
-        elif key == b"g":
-            d = Dialog(4, 4, title="Go to")
-            d.add(1, 1, WLabel("Label/addr:"))
-            entry = WAutoComplete(20, "", self.model.AS.get_label_list())
-            entry.popup_h = 12
-            entry.finish_dialog = ACTION_OK
-            d.add(13, 1, entry)
-            d.add(1, 2, WLabel("Press Down to auto-complete"))
-            res = d.loop()
-            self.redraw()
-
-            if res == ACTION_OK:
-                value = entry.get_text()
-                if '0' <= value[0] <= '9':
-                    addr = int(value, 0)
-                else:
-                    addr = self.model.AS.resolve_label(value)
-                self.goto_addr(addr, from_addr=self.cur_addr())
 
         elif key == editor.KEY_F1:
             help.help(self)
@@ -499,6 +537,7 @@ class Editor(editor.EditorExt):
         elif key == b"S":
             self.show_status("Saving...")
             saveload.save_state(project_dir)
+            self.model.AS.changed = False
             self.show_status("Saved.")
         elif key == b"\x11":  # ^Q
             class IssueList(WListBox):
@@ -665,9 +704,15 @@ class Editor(editor.EditorExt):
             self.show_status("Unbound key: " + repr(key))
 
 
+ACTION_MAP = {
+    b"g": DisasmViewer.action_goto,
+    b"a": DisasmViewer.action_make_ascii,
+}
+
+
 CPU_PLUGIN = None
 ENTRYPOINTS = []
-show_bytes = 0
+APP.show_bytes = 4
 
 def filter_config_line(l):
     l = re.sub(r"#.*$", "", l)
@@ -748,7 +793,6 @@ def load_target_file(loader, fname):
 
 def parse_disasm_def(fname):
     global CPU_PLUGIN
-    global show_bytes
     with open(fname) as f:
         for l in f:
             l = filter_config_line(l)
@@ -790,7 +834,7 @@ def parse_disasm_def(fname):
                 print("Loading CPU plugin %s" % (args[1]))
             elif l.startswith("show bytes "):
                 args = l.split()
-                show_bytes = int(args[2])
+                APP.show_bytes = int(args[2])
             elif l.startswith("area "):
                 args = l.split()
                 assert len(args) == 4
@@ -805,7 +849,7 @@ class MainScreen:
 
     def __init__(self):
         self.screen_size = Screen.screen_size()
-        self.e = Editor(1, 2, self.screen_size[0] - 2, self.screen_size[1] - 4)
+        self.e = DisasmViewer(1, 2, self.screen_size[0] - 2, self.screen_size[1] - 4)
 
         menu_file = WMenuBox([
             ("Save (Shift+s)", b"S"), ("Write disasm (Shift+w)", b"W"),
@@ -840,7 +884,9 @@ class MainScreen:
 
     def redraw(self, allow_cursor=True):
         self.menu_bar.redraw()
+        self.e.attr_color(C_B_WHITE, C_BLUE)
         self.e.draw_box(0, 1, self.screen_size[0], self.screen_size[1] - 2)
+        self.e.attr_reset()
         self.e.redraw()
         if allow_cursor:
             self.e.cursor(True)
@@ -929,9 +975,8 @@ if __name__ == "__main__":
     APP.is_ui = False
     engine.ADDRESS_SPACE.is_loading = True
 
-    engine.DisasmObj.LEADER_SIZE = 8 + 1
-    if show_bytes:
-        engine.DisasmObj.LEADER_SIZE += show_bytes * 2 + 1
+    # Calc various offset based on show_bytes value
+    APP.set_show_bytes(APP.show_bytes)
 
     # Strip suffix if any from def filename
     project_dir = project_name + ".scratchabit"
@@ -976,6 +1021,7 @@ if __name__ == "__main__":
     #sys.exit()
 
     engine.ADDRESS_SPACE.is_loading = False
+    engine.ADDRESS_SPACE.changed = False
     Screen.init_tty()
     try:
         Screen.cls()
